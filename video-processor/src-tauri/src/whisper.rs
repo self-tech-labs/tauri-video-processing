@@ -11,6 +11,7 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+use std::process;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TranscriptSegment {
@@ -27,10 +28,30 @@ pub struct Transcript {
 
 /// Transcribe audio file using Whisper
 pub fn transcribe_audio(audio_path: &str) -> Result<String, AppError> {
+    // Add memory logging helper
+    let log_memory = |stage: &str| {
+        if let Ok(memory) = process::Command::new("ps")
+            .args(&["-o", "rss=", "-p", &process::id().to_string()])
+            .output() 
+        {
+            let memory_kb = String::from_utf8_lossy(&memory.stdout)
+                .trim()
+                .parse::<u64>()
+                .unwrap_or(0);
+            eprintln!("Memory usage at {}: {} MB", stage, memory_kb / 1024);
+        }
+    };
+
+    // Log initial memory usage
+    log_memory("start");
+    
     // Load Whisper model
     let model_path = download_whisper_model()?;
+    log_memory("after model download");
+    
     let ctx = WhisperContext::new_with_params(&model_path, WhisperContextParameters::default())
         .map_err(|e| AppError::WhisperError(format!("Failed to load Whisper model: {}", e)))?;
+    log_memory("after context creation");
     
     // Set up parameters
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
@@ -46,12 +67,19 @@ pub fn transcribe_audio(audio_path: &str) -> Result<String, AppError> {
     
     // Load audio data from file
     let audio_data = load_audio_file(audio_path)?;
+    log_memory("after audio load");
+    
+    // Log audio data size
+    eprintln!("Audio data size: {} MB", (audio_data.len() * std::mem::size_of::<f32>()) / (1024 * 1024));
     
     let mut state = ctx.create_state()
         .map_err(|e| AppError::WhisperError(format!("Failed to create Whisper state: {}", e)))?;
+    log_memory("after state creation");
     
+    eprintln!("Starting inference...");
     state.full(params, &audio_data)
         .map_err(|e| AppError::WhisperError(format!("Failed to run Whisper inference: {}", e)))?;
+    log_memory("after inference");
     
     // Extract segments
     let num_segments = state.full_n_segments()
@@ -106,11 +134,11 @@ fn download_whisper_model() -> Result<String, AppError> {
     std::fs::create_dir_all(&model_dir)
         .map_err(|e| AppError::IoError(e))?;
     
-    let model_path = model_dir.join("ggml-base.en.bin");
+    let model_path = model_dir.join("ggml-tiny.en.bin");
     
     if !model_path.exists() {
         // Download the model
-        let url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin";
+        let url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin";
         
         let status = Command::new("curl")
             .arg("-L")
@@ -170,6 +198,7 @@ pub fn analyze_transcript_for_cuts(transcript_path: &str) -> Result<Vec<crate::v
 }
 
 fn load_audio_file(path: &Path) -> Result<Vec<f32>, AppError> {
+    eprintln!("Starting audio file load from: {}", path.display());
     // Open the media source
     let file = File::open(path)
         .map_err(|e| AppError::WhisperError(format!("Failed to open audio file: {}", e)))?;
@@ -302,6 +331,16 @@ fn load_audio_file(path: &Path) -> Result<Vec<f32>, AppError> {
         }
         
         audio_data = resampled;
+    }
+    
+    // Add size logging for audio data
+    eprintln!("Loaded audio data size: {} samples", audio_data.len());
+    if spec.channels.unwrap().count() > 1 {
+        eprintln!("Converting from {} channels to mono", spec.channels.unwrap().count());
+    }
+    
+    if sample_rate != 16000 {
+        eprintln!("Resampling from {}Hz to 16000Hz", sample_rate);
     }
     
     Ok(audio_data)
